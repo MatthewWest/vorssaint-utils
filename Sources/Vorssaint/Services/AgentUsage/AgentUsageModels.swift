@@ -6,7 +6,7 @@ import Foundation
 /// The coding agents whose session logs the island reads. Their names are
 /// product names and stay untranslated.
 enum AgentProvider: String, CaseIterable, Identifiable, Codable {
-    case claude, codex, opencode, copilot
+    case claude, codex, opencode, copilot, antigravity
 
     var id: String { rawValue }
 
@@ -16,6 +16,7 @@ enum AgentProvider: String, CaseIterable, Identifiable, Codable {
         case .codex: return "Codex"
         case .opencode: return "OpenCode"
         case .copilot: return "GitHub Copilot"
+        case .antigravity: return "Google Antigravity"
         }
     }
 
@@ -25,11 +26,12 @@ enum AgentProvider: String, CaseIterable, Identifiable, Codable {
         case .codex: return "chevron.left.forwardslash.chevron.right"
         case .opencode: return "terminal"
         case .copilot: return "infinity"
+        case .antigravity: return "atom"
         }
     }
 
     /// Whether the provider records a plan allowance in its local logs.
-    var reportsLimits: Bool { self != .copilot }
+    var reportsLimits: Bool { self != .copilot && self != .antigravity }
 }
 
 /// Token counts in the shape both logs can be reduced to. `input` excludes
@@ -156,4 +158,37 @@ enum AgentUsageEvent: Equatable {
     case limitWarning(provider: AgentProvider, window: AgentLimitWindow)
     case limitReset(provider: AgentProvider, window: AgentLimitWindow)
     case budgetReached(spent: Double, budget: Double)
+}
+
+/// Progress and state tracking for an Antigravity conversation database.
+struct AgentAntigravityProgress: Equatable {
+    var lastStepIndex: Int64 = -1
+    var lastGenIndex: Int64 = -1
+    var parentSession: String = ""
+    var parentPath: String = ""
+    var isSubagent: Bool = false
+    var summaryModified: Date = .distantPast
+    var openSteps: [Int64: (stepType: Int, status: Int, digest: UInt64, time: Date)] = [:]
+    var sessionID: String = ""
+    var rootID: String = ""
+    var workspaceFolder: String = ""
+    var branchName: String = ""
+
+    static func == (lhs: AgentAntigravityProgress, rhs: AgentAntigravityProgress) -> Bool {
+        lhs.lastStepIndex == rhs.lastStepIndex &&
+        lhs.lastGenIndex == rhs.lastGenIndex &&
+        lhs.parentSession == rhs.parentSession &&
+        lhs.parentPath == rhs.parentPath &&
+        lhs.isSubagent == rhs.isSubagent &&
+        lhs.summaryModified == rhs.summaryModified &&
+        lhs.sessionID == rhs.sessionID &&
+        lhs.rootID == rhs.rootID &&
+        lhs.workspaceFolder == rhs.workspaceFolder &&
+        lhs.branchName == rhs.branchName &&
+        lhs.openSteps.count == rhs.openSteps.count &&
+        lhs.openSteps.allSatisfy { k, v in
+            guard let rv = rhs.openSteps[k] else { return false }
+            return v.stepType == rv.stepType && v.status == rv.status && v.digest == rv.digest && v.time == rv.time
+        }
+    }
 }

@@ -843,6 +843,27 @@ enum AgentLogParser {
         guard let text = value as? String else { return seconds(value) }
         return AgentTimestamp.parse(text)
     }
+
+    // MARK: Google Antigravity
+
+    /// Helper for parsing line-based or synthetic Antigravity events.
+    static func parseAntigravity(_ line: Data, state: inout AgentLogState, now: Date = Date()) -> [AgentLogEntry] {
+        if contains(line, #""type":"reset""#) {
+            state.turnOpen = false
+            return [.reset(now)]
+        }
+        guard let json = object(line) else { return [] }
+        if json["type"] as? String == "reset" {
+            state.turnOpen = false
+            return [.reset(now)]
+        }
+        return []
+    }
+
+    static func parseAntigravity(_ line: Data) -> [AgentLogEntry] {
+        var dummy = AgentLogState()
+        return parseAntigravity(line, state: &dummy, now: Date())
+    }
 }
 
 /// ISO 8601 times as both agents write them, "2026-09-21T23:42:45.078Z",

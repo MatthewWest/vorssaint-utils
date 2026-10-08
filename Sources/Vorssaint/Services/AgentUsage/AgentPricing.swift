@@ -211,11 +211,42 @@ enum AgentPricing {
     static let siblings = ["mini", "nano", "pro", "lite", "research", "search", "audio", "realtime",
                            "transcribe", "tts", "cyber", "image"]
 
+    static let catalog: [AgentPriceList.Model] = [
+        // Gemini 3.8: flash-lite before flash
+        AgentPriceList.Model(id: "gemini-3.8-flash-lite", price: AgentPrice(input: 0.25, output: 1.0, cacheRead: 0.0625, cacheWrite: 0.25, cacheWriteLong: 0.25)),
+        AgentPriceList.Model(id: "gemini-3.8-flash", price: AgentPrice(input: 0.75, output: 3.75, cacheRead: 0.1875, cacheWrite: 0.75, cacheWriteLong: 0.75)),
+        AgentPriceList.Model(id: "gemini-3.8-pro", price: AgentPrice(input: 2.5, output: 15.0, cacheRead: 0.625, cacheWrite: 2.5, cacheWriteLong: 2.5)),
+
+        // Gemini 3.1: flash-lite before flash
+        AgentPriceList.Model(id: "gemini-3.1-pro-high", price: AgentPrice(input: 2.5, output: 15.0, cacheRead: 0.625, cacheWrite: 2.5, cacheWriteLong: 2.5)),
+        AgentPriceList.Model(id: "gemini-3.1-pro", price: AgentPrice(input: 2.0, output: 12.0, cacheRead: 0.5, cacheWrite: 2.0, cacheWriteLong: 2.0)),
+        AgentPriceList.Model(id: "gemini-3.1-flash-lite", price: AgentPrice(input: 0.25, output: 1.0, cacheRead: 0.0625, cacheWrite: 0.25, cacheWriteLong: 0.25)),
+        AgentPriceList.Model(id: "gemini-3.1-flash", price: AgentPrice(input: 0.5, output: 3.0, cacheRead: 0.125, cacheWrite: 0.5, cacheWriteLong: 0.5)),
+
+        // Gemini 3: flash-lite before flash
+        AgentPriceList.Model(id: "gemini-3-flash-lite", price: AgentPrice(input: 0.15, output: 0.6, cacheRead: 0.0375, cacheWrite: 0.15, cacheWriteLong: 0.15)),
+        AgentPriceList.Model(id: "gemini-3-flash", price: AgentPrice(input: 0.5, output: 3.0, cacheRead: 0.125, cacheWrite: 0.5, cacheWriteLong: 0.5)),
+
+        // Gemini 2.5: flash-lite before flash
+        AgentPriceList.Model(id: "gemini-2.5-pro", price: AgentPrice(input: 1.25, output: 10.0, cacheRead: 0.3125, cacheWrite: 1.25, cacheWriteLong: 1.25)),
+        AgentPriceList.Model(id: "gemini-2.5-flash-lite", price: AgentPrice(input: 0.1, output: 0.4, cacheRead: 0.025, cacheWrite: 0.1, cacheWriteLong: 0.1)),
+        AgentPriceList.Model(id: "gemini-2.5-flash", price: AgentPrice(input: 0.3, output: 2.5, cacheRead: 0.075, cacheWrite: 0.3, cacheWriteLong: 0.3)),
+
+        // Gemini 2.0: flash-lite before flash
+        AgentPriceList.Model(id: "gemini-2.0-flash-lite", price: AgentPrice(input: 0.075, output: 0.3, cacheRead: 0.01875, cacheWrite: 0.075, cacheWriteLong: 0.075)),
+        AgentPriceList.Model(id: "gemini-2.0-flash", price: AgentPrice(input: 0.1, output: 0.4, cacheRead: 0.025, cacheWrite: 0.1, cacheWriteLong: 0.1)),
+
+        // GPT-OSS
+        AgentPriceList.Model(id: "gpt-oss-120b-medium", price: AgentPrice(input: 0.15, output: 0.6, cacheRead: 0.0375, cacheWrite: 0.15, cacheWriteLong: 0.15)),
+        AgentPriceList.Model(id: "gpt-oss-120b", price: AgentPrice(input: 0.15, output: 0.6, cacheRead: 0.0375, cacheWrite: 0.15, cacheWriteLong: 0.15))
+    ]
+
     /// The longest matching family wins, so a point release the list names
     /// never inherits the price of the version it extends.
     static func price(for model: String, in list: AgentPriceList = AgentPricing.list) -> AgentPrice? {
         let id = normalized(model)
-        let table = id.hasPrefix("claude-") ? list.claude : list.codex
+        let sourceTable = id.hasPrefix("claude-") ? list.claude : list.codex
+        let table = sourceTable + catalog
         guard let match = table.filter({ matches(id, family: $0.id) })
             .max(by: { $0.id.count < $1.id.count }) else { return nil }
         // A smaller, larger or specialized sibling the list does not name is
@@ -235,7 +266,11 @@ enum AgentPricing {
         guard let next = rest.first else { return true }
         guard next == "-" || next == "_" || next == ":" else { return false }
         let number = rest.dropFirst().prefix { $0.isNumber }
-        return number.isEmpty || number.count >= 4
+        return number.isEmpty || number.count >= 4 || number.count == 3 || number.hasPrefix("00")
+    }
+
+    static func cost(_ tokens: AgentTokens, model: String) -> (cost: Double?, savings: Double) {
+        cost(AgentBillable(tokens: tokens), model: model)
     }
 
     static func cost(_ billable: AgentBillable, model: String) -> (cost: Double?, savings: Double) {
@@ -282,6 +317,34 @@ enum AgentPricing {
             let version = versions.joined(separator: ".")
             let name = [words.first?.capitalized ?? "", version] + words.dropFirst().map(\.capitalized)
             return name.filter { !$0.isEmpty }.joined(separator: " ")
+        }
+        if id.hasPrefix("gemini-") {
+            var raw = id
+            if let range = raw.range(of: "-preview") {
+                raw = String(raw[..<range.lowerBound])
+            }
+            if let range = raw.range(of: "-exp") {
+                raw = String(raw[..<range.lowerBound])
+            }
+            var parts = raw.dropFirst(7).split(separator: "-").map(String.init)
+            parts.removeAll { $0.count >= 6 && $0.allSatisfy(\.isNumber) }
+            parts.removeAll { $0.count == 3 && $0.allSatisfy(\.isNumber) }
+            parts.removeAll { $0.hasPrefix("00") }
+            parts.removeAll { $0 == "latest" }
+            let formatted = parts.map { part -> String in
+                if part.allSatisfy({ $0.isNumber || $0 == "." }) {
+                    return part
+                }
+                return part.capitalized
+            }
+            return (["Gemini"] + formatted).joined(separator: " ")
+        }
+        if id.hasPrefix("gpt-oss-") {
+            if id.hasPrefix("gpt-oss-120b") {
+                return "GPT-OSS 120B"
+            }
+            let parts = id.dropFirst(8).split(separator: "-").map { $0.uppercased() }
+            return (["GPT-OSS"] + parts).joined(separator: " ")
         }
         guard id.hasPrefix("gpt-") else { return id }
         var parts = id.dropFirst(4).split(separator: "-").map(String.init)

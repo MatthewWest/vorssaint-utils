@@ -62,13 +62,37 @@ final class AgentUsageStore {
                 let turn = provider == .copilot ? nil : tracksTurns ? file : parent
                 add(record, billable: billable, key: key, source: file, turn: turn, subagent: !tracksTurns)
             case .usageModel(let key, let model):
-                guard let position = index[key], records[position].model.isEmpty else { continue }
+                guard let position = index[key] else { continue }
                 let old = records[position]
+                guard !model.isEmpty && model != old.model else { continue }
+                let isAggregate = billables[position].isAggregate
+                let newCost: Double?
+                let newSavings: Double
+                let costDelta: Double
+                if !old.reportedCost && !isAggregate && old.tokens.total > 0 {
+                    let priced = AgentPricing.cost(old.tokens, model: model)
+                    newCost = priced.cost
+                    newSavings = priced.savings
+                    costDelta = (newCost ?? 0) - (old.cost ?? 0)
+                } else {
+                    newCost = old.cost
+                    newSavings = old.savings
+                    costDelta = 0
+                }
                 records[position] = AgentUsageRecord(provider: old.provider, date: old.date, model: model,
                     project: old.project, session: old.session, requests: old.requests,
-                    tokens: old.tokens, cost: old.cost, savings: old.savings, reportedCost: old.reportedCost)
-                // Incremental token updates keep the same model; attribution
-                // changes instead rebuild model buckets from the records.
+                    tokens: old.tokens, cost: newCost, savings: newSavings, reportedCost: old.reportedCost)
+                if var turn = turns[file] ?? waiting[file] {
+                    waiting[file] = nil
+                    turn.model = model
+                    turn.cost += costDelta
+                    turns[file] = turn
+                } else if let matchingKey = turns.keys.first(where: { $0.hasSuffix(old.session) }) {
+                    var turn = turns[matchingKey]!
+                    turn.model = model
+                    turn.cost += costDelta
+                    turns[matchingKey] = turn
+                }
                 summary.invalidate()
             case .limits(let reading):
                 updateLimits(reading)
@@ -164,6 +188,35 @@ final class AgentUsageStore {
             let old = records[position]
             let merged = old.tokens.merged(with: record.tokens)
             if merged == old.tokens {
+                if !record.model.isEmpty && record.model != old.model {
+                    let isAggregate = billables[position].isAggregate
+                    let newCost: Double?
+                    let newSavings: Double
+                    let extra: Double
+                    if !record.reportedCost && !old.reportedCost && !isAggregate && old.tokens.total > 0 {
+                        let priced = AgentPricing.cost(billables[position], model: record.model)
+                        newCost = priced.cost
+                        newSavings = priced.savings
+                        extra = (newCost ?? 0) - (old.cost ?? 0)
+                    } else {
+                        newCost = record.cost ?? old.cost
+                        newSavings = old.savings
+                        extra = (newCost ?? 0) - (old.cost ?? 0)
+                    }
+                    records[position] = AgentUsageRecord(provider: old.provider, date: old.date, model: record.model,
+                        project: old.project, session: old.session, requests: old.requests,
+                        tokens: old.tokens, cost: newCost, savings: newSavings,
+                        reportedCost: record.reportedCost || old.reportedCost)
+                    if let file, var turn = turns[file] ?? waiting[file],
+                       record.date >= turn.started.addingTimeInterval(-1) {
+                        waiting[file] = nil
+                        if !subagent { turn.model = record.model }
+                        turn.cost += extra
+                        turns[file] = turn
+                    }
+                    summary.invalidate()
+                    return
+                }
                 if record.provider == .opencode {
                     let newCost: Double?
                     let isReported: Bool
@@ -200,7 +253,8 @@ final class AgentUsageStore {
             combined.fast = combined.fast || billable.fast
             combined.domestic = combined.domestic || billable.domestic
             combined.isAggregate = combined.isAggregate || billable.isAggregate
-            let priced = AgentPricing.cost(combined, model: old.model)
+            let modelToUse = (!record.model.isEmpty && record.model != old.model) ? record.model : old.model
+            let priced = AgentPricing.cost(combined, model: modelToUse)
             let newCost: Double?
             let isReported: Bool
             if record.provider == .opencode {
@@ -225,10 +279,9 @@ final class AgentUsageStore {
                                 reasoning: merged.reasoning - old.tokens.reasoning)
             extra = (newCost ?? 0) - (old.cost ?? 0)
             billables[position] = combined
-            records[position].tokens = merged
-            records[position].cost = newCost
-            records[position].savings = priced.savings
-            records[position].reportedCost = isReported
+            records[position] = AgentUsageRecord(provider: old.provider, date: old.date, model: modelToUse,
+                project: old.project, session: old.session, requests: old.requests,
+                tokens: merged, cost: newCost, savings: priced.savings, reportedCost: isReported)
         } else {
             summary.recordChanged(at: records.count, previous: nil)
             index[key] = records.count
@@ -439,7 +492,8 @@ struct AgentLogRoot: Equatable {
     static func all(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [AgentLogRoot] {
         [(AgentProvider.claude, ".claude/projects"), (.claude, ".config/claude/projects"),
          (.codex, ".codex/sessions"), (.codex, ".codex/archived_sessions"),
-         (.opencode, ".local/share/opencode"), (.copilot, ".copilot/session-state")].map { provider, path in
+         (.opencode, ".local/share/opencode"), (.copilot, ".copilot/session-state"),
+         (.antigravity, ".gemini/antigravity"), (.antigravity, ".gemini/antigravity-cli")].map { provider, path in
             AgentLogRoot(provider: provider, url: canonical(home.appending(path: path, directoryHint: .isDirectory)))
         }
     }
@@ -462,6 +516,7 @@ struct AgentLogRoot: Equatable {
         let prefix = url.path + "/"
         guard path.hasPrefix(prefix) else { return false }
         if provider == .opencode { return path == url.appending(path: AgentOpenCodeReader.database).path }
+        if provider == .antigravity { return AgentAntigravityReader.accepts(root: self, path: path) }
         guard path.hasSuffix(".jsonl") else { return false }
         guard provider == .copilot else { return true }
         let parts = path.dropFirst(prefix.count).split(separator: "/", omittingEmptySubsequences: false)
@@ -522,6 +577,7 @@ final class AgentLogCursor {
     let parent: String?
     /// Replies still being written and the rows read last, for a database.
     var openCode = AgentOpenCodeProgress()
+    var antigravity = AgentAntigravityProgress()
     var offset: UInt64 = 0
     var identity: UInt64 = 0
     var pending = Data()
@@ -688,6 +744,12 @@ enum AgentLogReader {
                 let path = root.url.appending(path: AgentOpenCodeReader.database).path
                 if let modified = AgentOpenCodeReader.modified(path), modified >= horizon {
                     found.append((path, root.provider, modified, false))
+                }
+                continue
+            }
+            if root.provider == .antigravity {
+                for item in AgentAntigravityReader.discover(root: root, since: horizon) {
+                    found.append((item.path, item.provider, AgentAntigravityReader.modified(item.path) ?? horizon, false))
                 }
                 continue
             }
