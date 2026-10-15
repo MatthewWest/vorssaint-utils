@@ -289,6 +289,7 @@ final class AgentUsageService: ObservableObject {
         // Nothing from OpenCode's database is saved. Its open replies and
         // sessions live only in memory, so each launch reads it again.
         let kept = cursors.values.filter { !$0.restarted && $0.provider != .opencode }
+            .filter { $0.provider != .antigravity }
         let contents = AgentUsageArchive.Contents(providers: enabled, store: store.saved, cursors: kept.map(\.saved))
         if AgentUsageArchive.save(contents) { savedMark = mark }
     }
@@ -296,9 +297,9 @@ final class AgentUsageService: ObservableObject {
     /// Changes whenever a log is read further, replaced or let go. OpenCode,
     /// which is never saved, leaves it alone.
     private var progressMark: Int {
-        let records = store.records.reduce(0) { $1.provider == .opencode ? $0 : $0 + 1 }
+        let records = store.records.reduce(0) { ($1.provider == .opencode || $1.provider == .antigravity) ? $0 : $0 + 1 }
         return cursors.values.reduce(records) { mark, cursor in
-            guard cursor.provider != .opencode else { return mark }
+            guard cursor.provider != .opencode && cursor.provider != .antigravity else { return mark }
             var hasher = Hasher()
             hasher.combine(cursor.path)
             hasher.combine(cursor.offset)
@@ -347,6 +348,15 @@ final class AgentUsageService: ObservableObject {
                 if read(path, provider: cursor.provider) { changed = true }
                 continue
             }
+            if cursor.provider == .antigravity {
+                let dbModified = AgentAntigravityReader.modified(path) ?? cursor.modified
+                let summaryModified = AgentAntigravityReader.summaryModified(for: path) ?? .distantPast
+                let hasDbChange = dbModified > cursor.modified
+                let hasSummaryChange = summaryModified > cursor.antigravity.summaryModified
+                guard hasDbChange || hasSummaryChange else { continue }
+                if read(path, provider: cursor.provider) { changed = true }
+                continue
+            }
             var info = stat()
             let exists = stat(path, &info) == 0
             guard !exists || UInt64(max(0, info.st_size)) != cursor.offset
@@ -387,18 +397,32 @@ final class AgentUsageService: ObservableObject {
             case .codex: entries = AgentLogParser.parseCodex(line, state: &cursor.state, now: now)
             case .opencode: entries = AgentLogParser.parseOpenCode(line, state: &cursor.state, now: now)
             case .copilot: entries = AgentLogParser.parseCopilot(line, state: &cursor.state, now: now)
+            case .antigravity: entries = AgentLogParser.parseAntigravity(line, state: &cursor.state, now: now)
             }
             guard !entries.isEmpty else { return }
             changed = true
-            let isSubagent = provider == .opencode && !cursor.state.parentSession.isEmpty
+            let isSubagent = provider == .antigravity ? cursor.antigravity.isSubagent : (provider == .opencode && !cursor.state.parentSession.isEmpty)
             let turnFile = provider == .opencode && !cursor.state.session.isEmpty ? "\(path)#\(cursor.state.session)" : path
             let tracksTurns = isSubagent ? false : cursor.tracksTurns
-            let parent = isSubagent ? "\(path)#\(cursor.state.parentSession)" : cursor.parent
+            let parent = provider == .antigravity ? (isSubagent ? cursor.antigravity.parentPath : cursor.parent) : (isSubagent ? "\(path)#\(cursor.state.parentSession)" : cursor.parent)
             let finished = store.apply(entries, file: turnFile, provider: provider, tracksTurns: tracksTurns,
                                        parent: parent, modified: cursor.modified, now: now)
             finished.forEach(report)
         }
-        if provider == .copilot && cursor.offset == 0 {
+        if provider == .antigravity {
+            AgentAntigravityReader.read(path: path, cursor: cursor, now: now, since: now.addingTimeInterval(-Self.horizon),
+                                        shouldContinue: { !cancellation.isCancelled }) { entries in
+                guard !entries.isEmpty else { return }
+                changed = true
+                let isSubagent = cursor.antigravity.isSubagent
+                let turnFile = path
+                let tracksTurns = isSubagent ? false : cursor.tracksTurns
+                let parent = isSubagent ? cursor.antigravity.parentPath : cursor.parent
+                let finished = store.apply(entries, file: turnFile, provider: provider, tracksTurns: tracksTurns,
+                                           parent: parent, modified: cursor.modified, now: now)
+                finished.forEach(report)
+            }
+        } else if provider == .copilot && cursor.offset == 0 {
             AgentLogReader.readCopilotHistory(cursor, shouldContinue: { !cancellation.isCancelled }, line: consume)
         } else {
             AgentLogReader.readAppended(cursor, since: now.addingTimeInterval(-Self.horizon),
