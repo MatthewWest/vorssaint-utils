@@ -12,6 +12,7 @@ extension AgentProvider {
         case .codex: return Color(red: 0.49, green: 0.60, blue: 1.0)
         case .opencode: return Color(red: 0.06, green: 0.73, blue: 0.51)
         case .copilot: return Color(red: 0.30, green: 0.78, blue: 0.68)
+        case .antigravity: return Color(red: 0.26, green: 0.52, blue: 0.96)
         }
     }
 }
@@ -375,12 +376,19 @@ private extension AgentProvider {
         case .codex: return AgentCodexServer.appIdentifiers
         case .opencode: return ["ai.opencode.desktop", "ai.opencode.desktop.beta", "ai.opencode.desktop.dev"]
         case .copilot: return ["com.github.githubapp"]
+        case .antigravity: return ["com.google.antigravity"]
         }
     }
 
     /// The menu bar images keep a margin; the spark's thin rays need more
     /// of the box than the knot to look the same size.
-    var markScale: CGFloat { self == .claude ? 1.45 : 1.2 }
+    var markScale: CGFloat {
+        switch self {
+        case .claude: return 1.45
+        case .antigravity: return 1.2
+        case .codex, .opencode, .copilot: return 1.2
+        }
+    }
 
     /// What those apps name the mark they show in the menu bar.
     var menuBarImageNames: [String] {
@@ -390,6 +398,7 @@ private extension AgentProvider {
         // The OpenCode app shows nothing in the menu bar; its icon stands in.
         case .opencode: return []
         case .copilot: return []
+        case .antigravity: return []
         }
     }
 }
