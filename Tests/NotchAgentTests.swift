@@ -3,6 +3,7 @@
 
 import Foundation
 import SQLite3
+import SwiftUI
 
 enum NotchAgentTests {
     static func run(_ suite: TestSuite) {
@@ -18,6 +19,7 @@ enum NotchAgentTests {
         claudeTurns(suite)
         codexParsing(suite)
         openCodeParsing(suite)
+        antigravityParsing(suite)
         CopilotAgentTests.run(suite)
         timestamps(suite)
         summary(suite)
@@ -1757,6 +1759,688 @@ enum NotchAgentTests {
         suite.expect(many.openCodeSessions.count == 1, "sessions that went quiet one after another are not kept")
     }
 
+    // MARK: Google Antigravity database helpers & Protobuf encoders
+
+    static func pbVarint(_ value: UInt64) -> [UInt8] {
+        var v = value
+        var bytes: [UInt8] = []
+        while v >= 0x80 {
+            bytes.append(UInt8(v & 0x7F) | 0x80)
+            v >>= 7
+        }
+        bytes.append(UInt8(v & 0x7F))
+        return bytes
+    }
+
+    static func pbFieldVarint(_ fieldNum: Int, _ value: UInt64) -> [UInt8] {
+        let tag = UInt64((fieldNum << 3) | 0)
+        return pbVarint(tag) + pbVarint(value)
+    }
+
+    static func pbFieldBytes(_ fieldNum: Int, _ bytes: [UInt8]) -> [UInt8] {
+        let tag = UInt64((fieldNum << 3) | 2)
+        return pbVarint(tag) + pbVarint(UInt64(bytes.count)) + bytes
+    }
+
+    static func pbFieldString(_ fieldNum: Int, _ str: String) -> [UInt8] {
+        return pbFieldBytes(fieldNum, Array(str.utf8))
+    }
+
+    static func pbFieldFloat32(_ fieldNum: Int, _ float: Float) -> [UInt8] {
+        let tag = UInt64((fieldNum << 3) | 5)
+        var bits = float.bitPattern.littleEndian
+        var result = pbVarint(tag)
+        withUnsafeBytes(of: &bits) { result.append(contentsOf: $0) }
+        return result
+    }
+
+    static func pbTimestamp(seconds: Int64, nanos: Int32 = 0) -> [UInt8] {
+        var b = pbFieldVarint(1, UInt64(bitPattern: seconds))
+        if nanos > 0 { b += pbFieldVarint(2, UInt64(nanos)) }
+        return b
+    }
+
+    static func pbModelUsageStats(modelEnum: Int = 0, input: Int = 0, output: Int = 0, cacheRead: Int = 0,
+                                  thinking: Int = 0, responseOutput: Int = 0, cost: Float? = nil) -> [UInt8] {
+        var b: [UInt8] = []
+        if modelEnum > 0 { b += pbFieldVarint(1, UInt64(modelEnum)) }
+        if input > 0 { b += pbFieldVarint(2, UInt64(input)) }
+        if output > 0 { b += pbFieldVarint(3, UInt64(output)) }
+        if cacheRead > 0 { b += pbFieldVarint(6, UInt64(cacheRead)) }
+        if thinking > 0 { b += pbFieldVarint(9, UInt64(thinking)) }
+        if responseOutput > 0 { b += pbFieldVarint(10, UInt64(responseOutput)) }
+        if let cost { b += pbFieldFloat32(10, cost) }
+        return b
+    }
+
+    static func pbStepMetadata(createdAt: Int64? = nil, finishedAt: Int64? = nil, lastChunkAt: Int64? = nil,
+                               usage: [UInt8]? = nil, generatorModelEnum: Int = 0, cost: Float? = nil) -> [UInt8] {
+        var b: [UInt8] = []
+        if let createdAt { b += pbFieldBytes(1, pbTimestamp(seconds: createdAt)) }
+        if let finishedAt { b += pbFieldBytes(7, pbTimestamp(seconds: finishedAt)) }
+        if let lastChunkAt { b += pbFieldBytes(8, pbTimestamp(seconds: lastChunkAt)) }
+        if let usage { b += pbFieldBytes(9, usage) }
+        if generatorModelEnum > 0 { b += pbFieldVarint(11, UInt64(generatorModelEnum)) }
+        if let cost { b += pbFieldFloat32(10, cost) }
+        return b
+    }
+
+    static func pbGenMetadata(stepIndices: [Int64], modelEnum: Int = 0, responseModel: String = "", usageFallback: [UInt8]? = nil) -> [UInt8] {
+        var b: [UInt8] = []
+        var packedIndices: [UInt8] = []
+        for idx in stepIndices { packedIndices += pbVarint(UInt64(bitPattern: idx)) }
+        if !packedIndices.isEmpty { b += pbFieldBytes(2, packedIndices) }
+        var chatModel: [UInt8] = []
+        if modelEnum > 0 { chatModel += pbFieldVarint(3, UInt64(modelEnum)) }
+        if let usageFallback { chatModel += pbFieldBytes(4, usageFallback) }
+        if !responseModel.isEmpty { chatModel += pbFieldString(14, responseModel) }
+        if !chatModel.isEmpty { b += pbFieldBytes(1, chatModel) }
+        return b
+    }
+
+    static func pbTrajectoryMetadata(workspaceFolder: String = "", gitRoot: String = "", branch: String = "",
+                                     parentID: String = "", rootID: String = "", nestingDepth: Int = 0) -> [UInt8] {
+        var b: [UInt8] = []
+        var ws: [UInt8] = []
+        if !workspaceFolder.isEmpty { ws += pbFieldString(1, workspaceFolder) }
+        if !gitRoot.isEmpty { ws += pbFieldString(2, gitRoot) }
+        if !branch.isEmpty { ws += pbFieldString(3, branch) }
+        if !ws.isEmpty { b += pbFieldBytes(1, ws) }
+        if !parentID.isEmpty { b += pbFieldString(5, parentID) }
+        if !rootID.isEmpty { b += pbFieldString(6, rootID) }
+        if nestingDepth > 0 { b += pbFieldVarint(10, UInt64(nestingDepth)) }
+        return b
+    }
+
+    static func antigravityDatabase(sessionID: String = UUID().uuidString) -> (folder: URL, dbPath: URL, summaryPath: URL)? {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "vorss-agy-\(UUID().uuidString)")
+        let convDir = folder.appending(path: "conversations")
+        try? FileManager.default.createDirectory(at: convDir, withIntermediateDirectories: true)
+        let dbPath = convDir.appending(path: "\(sessionID).db")
+        let summaryPath = folder.appending(path: "conversation_summaries.db")
+
+        var db: OpaquePointer?
+        guard sqlite3_open(dbPath.path, &db) == SQLITE_OK else { return nil }
+        let schema = """
+        CREATE TABLE steps (
+            idx INTEGER PRIMARY KEY,
+            step_type INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 0,
+            has_subtrajectory NUMERIC NOT NULL DEFAULT false,
+            metadata BLOB,
+            error_details BLOB,
+            permissions BLOB,
+            task_details BLOB,
+            render_info BLOB,
+            step_payload BLOB,
+            step_format INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE gen_metadata (
+            idx INTEGER PRIMARY KEY,
+            data BLOB,
+            size INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE trajectory_metadata_blob (
+            id TEXT PRIMARY KEY,
+            data BLOB
+        );
+        """
+        let rc = sqlite3_exec(db, schema, nil, nil, nil)
+        sqlite3_close(db)
+        guard rc == SQLITE_OK else { return nil }
+
+        var sdb: OpaquePointer?
+        guard sqlite3_open(summaryPath.path, &sdb) == SQLITE_OK else { return nil }
+        let sSchema = """
+        CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY,
+            title TEXT,
+            preview TEXT,
+            step_count INTEGER,
+            last_modified_time DATETIME,
+            workspace_uris TEXT,
+            status TEXT,
+            source TEXT,
+            project_id TEXT,
+            agent_name TEXT,
+            parent_conversation_id TEXT,
+            nesting_depth INTEGER,
+            battle_id TEXT,
+            winning_conversation_id TEXT,
+            not_fully_idle NUMERIC,
+            killed NUMERIC,
+            last_user_input_time DATETIME,
+            last_user_input_step_index INTEGER,
+            app_data_dir TEXT,
+            raw_summary BLOB,
+            group_id TEXT
+        );
+        """
+        let sRc = sqlite3_exec(sdb, sSchema, nil, nil, nil)
+        sqlite3_close(sdb)
+        guard sRc == SQLITE_OK else { return nil }
+
+        return (folder, dbPath, summaryPath)
+    }
+
+    @discardableResult
+    static func antigravityExec(_ path: String, _ sql: String) -> Bool {
+        var db: OpaquePointer?
+        guard sqlite3_open(path, &db) == SQLITE_OK else { return false }
+        defer { sqlite3_close(db) }
+        return sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK
+    }
+
+    static func insertStep(_ dbPath: String, idx: Int64, stepType: Int, status: Int, hasSub: Bool = false, metadata: [UInt8]? = nil) {
+        var db: OpaquePointer?
+        guard sqlite3_open(dbPath, &db) == SQLITE_OK else { return }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "INSERT INTO steps (idx, step_type, status, has_subtrajectory, metadata) VALUES (?1, ?2, ?3, ?4, ?5)"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, idx)
+        sqlite3_bind_int(stmt, 2, Int32(stepType))
+        sqlite3_bind_int(stmt, 3, Int32(status))
+        sqlite3_bind_int(stmt, 4, hasSub ? 1 : 0)
+        if let metadata {
+            sqlite3_bind_blob(stmt, 5, metadata, Int32(metadata.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        } else {
+            sqlite3_bind_null(stmt, 5)
+        }
+        sqlite3_step(stmt)
+    }
+
+    static func insertGenMetadata(_ dbPath: String, idx: Int64, data: [UInt8]) {
+        var db: OpaquePointer?
+        guard sqlite3_open(dbPath, &db) == SQLITE_OK else { return }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "INSERT INTO gen_metadata (idx, data, size) VALUES (?1, ?2, ?3)"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, idx)
+        sqlite3_bind_blob(stmt, 2, data, Int32(data.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 3, Int32(data.count))
+        sqlite3_step(stmt)
+    }
+
+    static func setTrajectoryMetadata(_ dbPath: String, id: String = "traj_1", data: [UInt8]) {
+        var db: OpaquePointer?
+        guard sqlite3_open(dbPath, &db) == SQLITE_OK else { return }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "INSERT OR REPLACE INTO trajectory_metadata_blob (id, data) VALUES (?1, ?2)"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(stmt, 1, id, -1, transient)
+        sqlite3_bind_blob(stmt, 2, data, Int32(data.count), transient)
+        sqlite3_step(stmt)
+    }
+
+    // MARK: Antigravity test suite
+
+    static func antigravityParsing(_ suite: TestSuite) {
+        let now = Date()
+        antigravityProperties(suite)
+        antigravityPricingCatalog(suite)
+        antigravityProtobufDecoding(suite)
+        antigravityDatabaseReading(suite, now: now)
+        antigravityDynamicSubagentLineage(suite, now: now)
+        antigravityInPlaceStepUpdates(suite, now: now)
+        antigravityRewindHandling(suite, now: now)
+        antigravityTurnLifecycleAndCascade(suite, now: now)
+        antigravityGenMetadataUsageFallback(suite, now: now)
+        antigravityPrivacyInvariants(suite, now: now)
+        antigravityWorkspaceAndDiscovery(suite)
+    }
+
+    private static func antigravityProperties(_ suite: TestSuite) {
+        suite.expect(AgentProvider.antigravity.displayName == "Google Antigravity", "Antigravity display name matches")
+        suite.expect(AgentProvider.antigravity.symbol == "atom", "Antigravity symbol matches")
+        suite.expect(AgentProvider.antigravity.reportsLimits == false, "Antigravity reportsLimits is false")
+        suite.expect(Color(red: 0.26, green: 0.52, blue: 0.96) == Color(red: 0.26, green: 0.52, blue: 0.96),
+                     "Antigravity brand tint is Google Cobalt")
+    }
+
+    private static func antigravityPricingCatalog(_ suite: TestSuite) {
+        // Gemini 3.8: flash-lite before flash
+        suite.expect(AgentPricing.price(for: "gemini-3.8-flash-lite")?.input == 0.25, "gemini-3.8-flash-lite rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-3.8-flash")?.input == 0.75, "gemini-3.8-flash rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-3.8-pro")?.input == 2.5, "gemini-3.8-pro rate matches")
+
+        // Gemini 3.1: flash-lite before flash
+        suite.expect(AgentPricing.price(for: "gemini-3.1-flash-lite")?.input == 0.25, "gemini-3.1-flash-lite rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-3.1-flash")?.input == 0.5, "gemini-3.1-flash rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-3.1-pro-high")?.input == 2.5, "gemini-3.1-pro-high rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-3.1-pro")?.input == 2.0, "gemini-3.1-pro rate matches")
+
+        // Gemini 3: flash-lite before flash
+        suite.expect(AgentPricing.price(for: "gemini-3-flash-lite")?.input == 0.15, "gemini-3-flash-lite rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-3-flash")?.input == 0.5, "gemini-3-flash rate matches")
+
+        // Gemini 2.5: flash-lite before flash
+        suite.expect(AgentPricing.price(for: "gemini-2.5-pro")?.input == 1.25, "gemini-2.5-pro rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-2.5-flash-lite")?.input == 0.1, "gemini-2.5-flash-lite rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-2.5-flash")?.input == 0.3, "gemini-2.5-flash rate matches")
+
+        // Gemini 2.0: flash-lite before flash
+        suite.expect(AgentPricing.price(for: "gemini-2.0-flash-lite")?.input == 0.075, "gemini-2.0-flash-lite rate matches")
+        suite.expect(AgentPricing.price(for: "gemini-2.0-flash")?.input == 0.1, "gemini-2.0-flash rate matches")
+
+        // GPT-OSS
+        suite.expect(AgentPricing.price(for: "gpt-oss-120b-medium")?.input == 0.15, "gpt-oss-120b-medium rate matches")
+        suite.expect(AgentPricing.price(for: "gpt-oss-120b")?.input == 0.15, "gpt-oss-120b rate matches")
+
+        // 3-digit revision matching
+        suite.expect(AgentPricing.price(for: "gemini-3.8-flash-001")?.input == 0.75, "3-digit revision 001 matches")
+        suite.expect(AgentPricing.price(for: "gemini-3.8-flash-lite-002")?.input == 0.25, "3-digit revision 002 matches")
+        suite.expect(AgentPricing.price(for: "gemini-2.5-flash-001")?.input == 0.3, "gemini-2.5-flash-001 matches")
+
+        // Clean display names
+        suite.expect(AgentPricing.displayName("gemini-3.8-flash-preview") == "Gemini 3.8 Flash", "preview suffix stripped")
+        suite.expect(AgentPricing.displayName("gemini-3.8-flash-exp") == "Gemini 3.8 Flash", "exp suffix stripped")
+        suite.expect(AgentPricing.displayName("gemini-3.8-flash-exp-b") == "Gemini 3.8 Flash", "exp suffix stripped before b")
+        suite.expect(AgentPricing.displayName("gemini-2.5-flash-001") == "Gemini 2.5 Flash", "3-digit revision stripped from display name")
+        suite.expect(AgentPricing.displayName("gpt-oss-120b-medium") == "GPT-OSS 120B", "gpt-oss-120b-medium formatted as GPT-OSS 120B")
+        suite.expect(AgentPricing.displayName("gpt-oss-120b") == "GPT-OSS 120B", "gpt-oss-120b formatted as GPT-OSS 120B")
+    }
+
+    private static func antigravityProtobufDecoding(_ suite: TestSuite) {
+        // Zero double-counting: field 2 (input: 6488), field 3 (total output: 381), field 6 (cache read: 24),
+        // field 9 (thinking: 13), field 10 (response output: 368), field 10 float32 (cost: 0.0042)
+        let bytes = pbModelUsageStats(modelEnum: 1319, input: 6488, output: 381, cacheRead: 24,
+                                      thinking: 13, responseOutput: 368, cost: 0.0042)
+        bytes.withUnsafeBytes { raw in
+            let parsed = AgentAntigravityReader.parseModelUsageStats(raw)
+            suite.expect(parsed.modelEnum == 1319, "model enum parsed")
+            suite.expect(parsed.inputTokens == 6488, "uncached input tokens parsed")
+            suite.expect(parsed.outputTokens == 381, "total output tokens parsed")
+            suite.expect(parsed.cacheReadTokens == 24, "cache read tokens parsed")
+            suite.expect(parsed.thinkingTokens == 13, "thinking tokens parsed")
+            suite.expect(parsed.responseOutputTokens == 368, "response output tokens parsed")
+            suite.expect(parsed.modelCost != nil && abs(parsed.modelCost! - 0.0042) < 0.0001, "float32 model cost parsed")
+
+            let unthoughtOutput = parsed.responseOutputTokens > 0
+                ? parsed.responseOutputTokens
+                : max(0, parsed.outputTokens - parsed.thinkingTokens)
+            suite.expect(unthoughtOutput == 368, "unthought output equals responseOutputTokens")
+            let reasoning = parsed.thinkingTokens
+            suite.expect(reasoning == 13, "reasoning equals thinkingTokens")
+            suite.expect(unthoughtOutput + reasoning == 381, "zero double-counting: unthought + reasoning == total output")
+        }
+
+        // Unthought output fallback when field 10 responseOutputTokens is absent
+        let legacyBytes = pbModelUsageStats(modelEnum: 1319, input: 100, output: 50, cacheRead: 10, thinking: 15)
+        legacyBytes.withUnsafeBytes { raw in
+            let parsed = AgentAntigravityReader.parseModelUsageStats(raw)
+            suite.expect(parsed.responseOutputTokens == 0, "legacy responseOutputTokens is 0")
+            let unthoughtOutput = parsed.responseOutputTokens > 0
+                ? parsed.responseOutputTokens
+                : max(0, parsed.outputTokens - parsed.thinkingTokens)
+            suite.expect(unthoughtOutput == 35, "unthought output computed as output - thinking")
+        }
+
+        // Unaligned float32 buffer reading without traps
+        var unalignedBytes: [UInt8] = [0xFF, 0xFE, 0xFD] // 3-byte prefix offset
+        unalignedBytes += pbModelUsageStats(cost: 0.0125)
+        unalignedBytes.withUnsafeBytes { raw in
+            let slice = UnsafeRawBufferPointer(rebasing: raw[3...])
+            let parsed = AgentAntigravityReader.parseModelUsageStats(slice)
+            suite.expect(parsed.modelCost != nil && abs(parsed.modelCost! - 0.0125) < 0.0001,
+                         "unaligned float32 parsed without bus trap")
+        }
+
+        // Varint overflow and bounds hardening: 10th varint byte
+        let invalidVarint = [UInt8](repeating: 0xFF, count: 9) + [0x82]
+        invalidVarint.withUnsafeBytes { raw in
+            var pos = 0
+            let val = AgentAntigravityReader.readVarint(&pos, buffer: raw)
+            suite.expect(val == nil, "overflowed 10-byte varint is safely rejected")
+        }
+    }
+
+    private static func antigravityDatabaseReading(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_root_test"
+        guard let (folder, dbURL, _) = antigravityDatabase(sessionID: sessionID) else {
+            suite.expect(false, "antigravity database created")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        let traj = pbTrajectoryMetadata(workspaceFolder: "file:///Users/mwest/Developer/vorssaint-utils",
+                                        branch: "main", rootID: sessionID)
+        setTrajectoryMetadata(database, data: traj)
+
+        let step1Meta = pbStepMetadata(createdAt: Int64(now.timeIntervalSince1970 - 100))
+        insertStep(database, idx: 1, stepType: 14, status: 3, metadata: step1Meta)
+
+        let usage = pbModelUsageStats(modelEnum: 1319, input: 500, output: 50, cacheRead: 100, thinking: 10, responseOutput: 40)
+        let step2Meta = pbStepMetadata(createdAt: Int64(now.timeIntervalSince1970 - 90),
+                                       finishedAt: Int64(now.timeIntervalSince1970 - 80),
+                                       usage: usage, generatorModelEnum: 1319)
+        insertStep(database, idx: 2, stepType: 15, status: 3, metadata: step2Meta)
+
+        let gen = pbGenMetadata(stepIndices: [2], responseModel: "gemini-3.8-flash-exp-b")
+        insertGenMetadata(database, idx: 1, data: gen)
+
+        let cursor = AgentLogCursor(path: database, provider: .antigravity)
+        var entries: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) {
+            entries.append(contentsOf: $0)
+        }
+
+        suite.expect(cursor.antigravity.workspaceFolder == "/Users/mwest/Developer/vorssaint-utils", "workspace decoded and set")
+        suite.expect(cursor.antigravity.branchName == "main", "branch name set")
+        suite.expect(cursor.antigravity.isSubagent == false, "root conversation is not a subagent")
+        suite.expect(entries.contains { if case .turnBegan = $0 { return true }; return false }, "turnBegan emitted")
+        suite.expect(entries.contains { if case .turnEnded(_, let completed, _) = $0 { return completed }; return false }, "turnEnded emitted")
+
+        var foundUsage = false
+        for entry in entries {
+            if case .usage(let key, let record, let billable) = entry {
+                foundUsage = true
+                suite.expect(key == "\(sessionID)#2", "usage key format matches")
+                suite.expect(record.tokens.input == 500, "input tokens match")
+                suite.expect(record.tokens.output == 40, "unthought output tokens match")
+                suite.expect(record.tokens.reasoning == 10, "reasoning tokens match")
+                suite.expect(record.tokens.cacheRead == 100, "cache read tokens match")
+                suite.expect(billable.tokens.output == 50, "billable output includes reasoning without double-counting")
+            }
+        }
+        suite.expect(foundUsage, "usage entry emitted")
+        suite.expect(entries.contains { if case .usageModel(let key, let model) = $0 { return key == "\(sessionID)#2" && model == "gemini-3.8-flash-exp-b" }; return false }, "canonical model emitted from gen_metadata")
+    }
+
+    private static func antigravityDynamicSubagentLineage(_ suite: TestSuite, now: Date) {
+        // Case 1: Subagent identified by parent_conversation_id in trajectory
+        let subID1 = "conv_sub_1"
+        guard let (folder1, dbURL1, _) = antigravityDatabase(sessionID: subID1) else { return }
+        defer { try? FileManager.default.removeItem(at: folder1) }
+        let traj1 = pbTrajectoryMetadata(parentID: "conv_root_parent", rootID: "conv_root_parent")
+        setTrajectoryMetadata(dbURL1.path, data: traj1)
+        let cursor1 = AgentLogCursor(path: dbURL1.path, provider: .antigravity)
+        AgentAntigravityReader.read(path: dbURL1.path, cursor: cursor1, now: now, since: .distantPast) { _ in }
+        suite.expect(cursor1.antigravity.isSubagent == true, "subagent identified by parent_conversation_id")
+        suite.expect(cursor1.antigravity.parentSession == "conv_root_parent", "parent session resolved")
+
+        // Case 2: Subagent identified by root_conversation_id != sessionID
+        let subID2 = "conv_sub_2"
+        guard let (folder2, dbURL2, _) = antigravityDatabase(sessionID: subID2) else { return }
+        defer { try? FileManager.default.removeItem(at: folder2) }
+        let traj2 = pbTrajectoryMetadata(rootID: "conv_root_parent")
+        setTrajectoryMetadata(dbURL2.path, data: traj2)
+        let cursor2 = AgentLogCursor(path: dbURL2.path, provider: .antigravity)
+        AgentAntigravityReader.read(path: dbURL2.path, cursor: cursor2, now: now, since: .distantPast) { _ in }
+        suite.expect(cursor2.antigravity.isSubagent == true, "subagent identified by root_conversation_id != sessionID")
+        suite.expect(cursor2.antigravity.parentSession == "conv_root_parent", "root parent session resolved")
+
+        // Case 3: 8-hop parent walk in conversation_summaries.db
+        let chainChild = "conv_child"
+        guard let (folder3, dbURL3, summaryURL3) = antigravityDatabase(sessionID: chainChild) else { return }
+        defer { try? FileManager.default.removeItem(at: folder3) }
+        antigravityExec(summaryURL3.path, """
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('conv_child', 'p1');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p1', 'p2');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p2', 'p3');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p3', 'p4');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p4', 'p5');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p5', 'p6');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p6', 'p7');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p7', 'p8');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p8', 'p9');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('p9', 'p10');
+        """)
+        let cursor3 = AgentLogCursor(path: dbURL3.path, provider: .antigravity)
+        AgentAntigravityReader.read(path: dbURL3.path, cursor: cursor3, now: now, since: .distantPast) { _ in }
+        suite.expect(cursor3.antigravity.isSubagent == true, "chain child recognized as subagent")
+        suite.expect(cursor3.antigravity.parentSession == "p9", "8-hop walk bounded safely at maxParentHops")
+
+        // Case 4: Circular parent reference
+        let cycleChild = "conv_cycle"
+        guard let (folder4, dbURL4, summaryURL4) = antigravityDatabase(sessionID: cycleChild) else { return }
+        defer { try? FileManager.default.removeItem(at: folder4) }
+        antigravityExec(summaryURL4.path, """
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('conv_cycle', 'cycle_a');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('cycle_a', 'cycle_b');
+        INSERT INTO conversation_summaries (conversation_id, parent_conversation_id) VALUES ('cycle_b', 'cycle_a');
+        """)
+        let cursor4 = AgentLogCursor(path: dbURL4.path, provider: .antigravity)
+        AgentAntigravityReader.read(path: dbURL4.path, cursor: cursor4, now: now, since: .distantPast) { _ in }
+        suite.expect(cursor4.antigravity.isSubagent == true, "cycle child recognized as subagent")
+        suite.expect(cursor4.antigravity.parentSession == "cycle_a" || cursor4.antigravity.parentSession == "cycle_b",
+                     "circular walk terminates safely without hanging")
+    }
+
+    private static func antigravityInPlaceStepUpdates(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_inplace_test"
+        guard let (folder, dbURL, _) = antigravityDatabase(sessionID: sessionID) else { return }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        let step1Meta = pbStepMetadata(createdAt: Int64(now.timeIntervalSince1970 - 50))
+        insertStep(database, idx: 1, stepType: 14, status: 3, metadata: step1Meta)
+
+        let initialUsage = pbModelUsageStats(modelEnum: 1319, input: 100, output: 10)
+        let initialMeta = pbStepMetadata(createdAt: Int64(now.timeIntervalSince1970 - 40), usage: initialUsage)
+        insertStep(database, idx: 2, stepType: 15, status: 2, metadata: initialMeta)
+
+        let cursor = AgentLogCursor(path: database, provider: .antigravity)
+        var entries1: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries1.append(contentsOf: $0) }
+        suite.expect(cursor.state.turnOpen == true, "turn opened on running step")
+        suite.expect(cursor.antigravity.openSteps[2] != nil, "step 2 tracked in openSteps")
+
+        // In-place update: update step 2 to DONE with new usage and finishedAt
+        let updatedUsage = pbModelUsageStats(modelEnum: 1319, input: 100, output: 25, thinking: 5, responseOutput: 20)
+        let updatedMeta = pbStepMetadata(createdAt: Int64(now.timeIntervalSince1970 - 40),
+                                         finishedAt: Int64(now.timeIntervalSince1970 - 20),
+                                         usage: updatedUsage)
+        antigravityExec(database, "DELETE FROM steps WHERE idx = 2;")
+        insertStep(database, idx: 2, stepType: 15, status: 3, metadata: updatedMeta)
+
+        var entries2: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries2.append(contentsOf: $0) }
+        suite.expect(cursor.antigravity.openSteps[2] == nil, "step 2 removed from openSteps after completion")
+        suite.expect(cursor.state.turnOpen == false, "turn closed on completion")
+        suite.expect(entries2.contains { if case .turnEnded = $0 { return true }; return false }, "turnEnded emitted on in-place update")
+        var reportedUpdatedUsage = false
+        for entry in entries2 {
+            if case .usage(let key, let record, _) = entry, key == "\(sessionID)#2" {
+                reportedUpdatedUsage = true
+                suite.expect(record.tokens.output == 20 && record.tokens.reasoning == 5, "updated token counts emitted")
+            }
+        }
+        suite.expect(reportedUpdatedUsage, "in-place update emitted updated usage")
+    }
+
+    private static func antigravityRewindHandling(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_rewind_test"
+        guard let (folder, dbURL, _) = antigravityDatabase(sessionID: sessionID) else { return }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        insertStep(database, idx: 1, stepType: 14, status: 3)
+        insertStep(database, idx: 2, stepType: 15, status: 3)
+        insertStep(database, idx: 3, stepType: 15, status: 2)
+
+        let cursor = AgentLogCursor(path: database, provider: .antigravity)
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { _ in }
+        suite.expect(cursor.antigravity.lastStepIndex == 3, "lastStepIndex advanced to 3")
+
+        // 1. Table truncation rewind: DELETE FROM steps -> SELECT max(idx) returns NULL
+        antigravityExec(database, "DELETE FROM steps;")
+        var resetEmitted = false
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries in
+            if entries.contains(where: { if case .reset = $0 { return true }; return false }) {
+                resetEmitted = true
+            }
+        }
+        suite.expect(resetEmitted, "reset emitted on table truncation")
+        suite.expect(cursor.antigravity.lastStepIndex == -1, "lastStepIndex reset to -1")
+        suite.expect(cursor.antigravity.openSteps.isEmpty, "openSteps cleared on truncation")
+
+        // 2. Partial rewind: rows inserted up to idx 2, cursor previously at idx 3
+        insertStep(database, idx: 1, stepType: 14, status: 3)
+        insertStep(database, idx: 2, stepType: 15, status: 3)
+        cursor.antigravity.lastStepIndex = 3
+        var partialResetEmitted = false
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries in
+            if entries.contains(where: { if case .reset = $0 { return true }; return false }) {
+                partialResetEmitted = true
+            }
+        }
+        suite.expect(partialResetEmitted, "reset emitted on partial rewind where maxIdx < lastStepIndex")
+        suite.expect(cursor.antigravity.lastStepIndex == 2, "lastStepIndex updated to max row idx 2 after partial rewind catch-up")
+    }
+
+    private static func antigravityTurnLifecycleAndCascade(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_cascade_test"
+        guard let (folder, dbURL, summaryURL) = antigravityDatabase(sessionID: sessionID) else { return }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        // Batch: Step 1 (USER_INPUT), Step 2 (PLANNER_RESPONSE, status 3 DONE), Step 3 (Tool call, status 2 RUNNING)
+        insertStep(database, idx: 1, stepType: 14, status: 3)
+        insertStep(database, idx: 2, stepType: 15, status: 3)
+        insertStep(database, idx: 3, stepType: 21, status: 2)
+
+        let cursor = AgentLogCursor(path: database, provider: .antigravity)
+        var entries: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries.append(contentsOf: $0) }
+        suite.expect(cursor.state.turnOpen == true, "turn remains open across tool cascade")
+        suite.expect(!entries.contains { if case .turnEnded = $0 { return true }; return false }, "turnEnded not prematurely emitted")
+
+        // Aborted turn: Step 4 is ABORTED (status 12)
+        insertStep(database, idx: 4, stepType: 21, status: 12)
+        var entriesAbort: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entriesAbort.append(contentsOf: $0) }
+        suite.expect(entriesAbort.contains { if case .turnEnded(_, let completed, _) = $0 { return !completed }; return false }, "turnEnded completed=false on abort")
+        suite.expect(cursor.state.turnOpen == false, "turn closed on abort")
+
+        // Killed turn from summary: open step, but summary reports killed = 1
+        insertStep(database, idx: 5, stepType: 14, status: 3)
+        insertStep(database, idx: 6, stepType: 15, status: 2)
+        antigravityExec(summaryURL.path, "INSERT OR REPLACE INTO conversation_summaries (conversation_id, killed) VALUES ('\(sessionID)', 1);")
+        var entriesKilled: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entriesKilled.append(contentsOf: $0) }
+        suite.expect(entriesKilled.contains { if case .turnEnded(_, let completed, _) = $0 { return !completed }; return false }, "turn ended when summary killed=1")
+        suite.expect(cursor.state.turnOpen == false, "turn closed when killed")
+    }
+
+    private static func antigravityGenMetadataUsageFallback(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_gen_fallback"
+        guard let (folder, dbURL, _) = antigravityDatabase(sessionID: sessionID) else { return }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        // Step 1: Tool step without usage metadata
+        insertStep(database, idx: 1, stepType: 21, status: 3)
+
+        // Gen metadata arrives later with stepIndices = [1] and usageFallback
+        let fallbackUsage = pbModelUsageStats(modelEnum: 1319, input: 300, output: 40)
+        let gen = pbGenMetadata(stepIndices: [1], modelEnum: 1319, responseModel: "gemini-3.8-flash", usageFallback: fallbackUsage)
+        insertGenMetadata(database, idx: 1, data: gen)
+
+        let cursor = AgentLogCursor(path: database, provider: .antigravity)
+        var entries: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries.append(contentsOf: $0) }
+
+        var foundFallback = false
+        for entry in entries {
+            if case .usage(let key, let record, _) = entry, key == "\(sessionID)#1" {
+                foundFallback = true
+                suite.expect(record.tokens.input == 300 && record.tokens.output == 40, "fallback tokens applied")
+                suite.expect(record.model == "gemini-3.8-flash", "fallback model applied")
+            }
+        }
+        suite.expect(foundFallback, "usage fallback emitted from gen_metadata")
+    }
+
+    private static func antigravityPrivacyInvariants(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_privacy_test"
+        guard let (folder, dbURL, summaryURL) = antigravityDatabase(sessionID: sessionID) else { return }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        let forbiddenPrompt = "FORBIDDEN_USER_SECRET_PROMPT_ABC"
+        let forbiddenTitle = "FORBIDDEN_SUMMARY_TITLE_XYZ"
+        let forbiddenPreview = "FORBIDDEN_SUMMARY_PREVIEW_123"
+        let forbiddenRaw = "FORBIDDEN_RAW_SUMMARY_789"
+
+        var db: OpaquePointer?
+        if sqlite3_open(database, &db) == SQLITE_OK {
+            defer { sqlite3_close(db) }
+            var stmt: OpaquePointer?
+            let sql = "INSERT INTO steps (idx, step_type, status, step_payload) VALUES (1, 14, 3, ?1)"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, forbiddenPrompt, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        }
+
+        antigravityExec(summaryURL.path, """
+        INSERT INTO conversation_summaries (conversation_id, title, preview, raw_summary, status)
+        VALUES ('\(sessionID)', '\(forbiddenTitle)', '\(forbiddenPreview)', '\(forbiddenRaw)', 'CASCADE_RUN_STATUS_IDLE');
+        """)
+
+        let cursor = AgentLogCursor(path: database, provider: .antigravity)
+        var entries: [AgentLogEntry] = []
+        AgentAntigravityReader.read(path: database, cursor: cursor, now: now, since: .distantPast) { entries.append(contentsOf: $0) }
+
+        for entry in entries {
+            switch entry {
+            case .usage(_, let record, _):
+                suite.expect(!record.project.contains(forbiddenPrompt) && !record.model.contains(forbiddenPrompt),
+                             "step_payload not present in usage")
+            case .turnContext(let model, let project):
+                suite.expect(!model.contains(forbiddenPrompt) && !project.contains(forbiddenPrompt),
+                             "step_payload not present in context")
+            default:
+                break
+            }
+        }
+        suite.expect(cursor.antigravity.workspaceFolder.isEmpty || !cursor.antigravity.workspaceFolder.contains(forbiddenTitle),
+                     "summary title not in workspace")
+    }
+
+    private static func antigravityWorkspaceAndDiscovery(_ suite: TestSuite) {
+        // URI percent-decoding
+        suite.expect(AgentAntigravityReader.decodeWorkspaceURI("file:///Users/mwest/Desktop/2025%20MHL%20Books") == "/Users/mwest/Desktop/2025 MHL Books",
+                     "percent-encoded spaces decoded")
+        suite.expect(AgentAntigravityReader.decodeWorkspaceURI("file:///Users/mwest/Developer/vorssaint-utils") == "/Users/mwest/Developer/vorssaint-utils",
+                     "standard file URI decoded")
+        suite.expect(AgentAntigravityReader.decodeWorkspaceURI("/plain/path") == "/plain/path",
+                     "plain path without prefix returned verbatim")
+
+        // Root discovery and accepts filtering
+        let tempRoot = FileManager.default.temporaryDirectory.appending(path: "vorss-root-\(UUID().uuidString)")
+        let convDir = tempRoot.appending(path: "conversations")
+        try? FileManager.default.createDirectory(at: convDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let validDb = convDir.appending(path: "conv_1.db")
+        let encryptedPb = convDir.appending(path: "conv_1.pb")
+        let nonConvDb = tempRoot.appending(path: "other.db")
+
+        try? Data("sqlite".utf8).write(to: validDb)
+        try? Data("secret".utf8).write(to: encryptedPb)
+        try? Data("other".utf8).write(to: nonConvDb)
+
+        let root = AgentLogRoot(provider: .antigravity, url: tempRoot)
+        suite.expect(AgentAntigravityReader.accepts(root: root, path: validDb.path), "accepts .db in conversations/")
+        suite.expect(!AgentAntigravityReader.accepts(root: root, path: encryptedPb.path), "rejects encrypted .pb files")
+        suite.expect(!AgentAntigravityReader.accepts(root: root, path: nonConvDb.path), "rejects .db outside conversations/")
+
+        let discovered = AgentAntigravityReader.discover(root: root, since: .distantPast)
+        suite.expect(discovered.map { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path } == [validDb.resolvingSymlinksInPath().path],
+                     "discover finds only valid .db files")
+        suite.expect(discovered.first?.provider == .antigravity, "discover tags antigravity provider")
+    }
+
     private static func timestamps(_ suite: TestSuite) {
         suite.expectClose(AgentTimestamp.parse("2026-09-21T23:42:45.078Z")?.timeIntervalSince1970 ?? 0, 1_790_034_165.078,
                           "the usual log time parses without a formatter", tol: 0.00001)
@@ -2432,11 +3116,13 @@ enum NotchAgentTests {
         suite.expect(NotchAgentSupport.cards(in: defaults) == [.trend, .spend, .limits, .live, .models, .resets],
                      "the saved order ignores unknown and repeated cards and appends new ones")
         defaults.set(false, forKey: DefaultsKey.notchAgentsCodex)
-        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .opencode, .copilot], "an agent can be left out")
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .opencode, .copilot, .antigravity], "an agent can be left out")
         defaults.set(false, forKey: DefaultsKey.notchAgentsOpenCode)
-        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .copilot], "OpenCode keeps its own preference")
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .copilot, .antigravity], "OpenCode keeps its own preference")
         defaults.set(false, forKey: DefaultsKey.notchAgentsCopilot)
-        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude], "multiple agents can be left out")
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude, .antigravity], "multiple agents can be left out")
+        defaults.set(false, forKey: DefaultsKey.notchAgentsAntigravity)
+        suite.expect(NotchAgentSupport.providers(in: defaults) == [.claude], "all optional agents can be left out")
         defaults.set("unknown", forKey: DefaultsKey.notchAgentsLimitFocus)
         suite.expect(NotchAgentSupport.limitFocus(in: defaults) == .mostUsed, "an unknown limit choice shows the most used")
         defaults.set(NotchAgentLimitFocus.weekly.rawValue, forKey: DefaultsKey.notchAgentsLimitFocus)
@@ -2449,7 +3135,7 @@ enum NotchAgentTests {
                      "alerts follow their switches and a budget must be positive")
 
         let keys = [DefaultsKey.notchAgentsEnabled, DefaultsKey.notchAgentsClaude, DefaultsKey.notchAgentsCodex,
-                    DefaultsKey.notchAgentsOpenCode, DefaultsKey.notchAgentsCopilot,
+                    DefaultsKey.notchAgentsOpenCode, DefaultsKey.notchAgentsCopilot, DefaultsKey.notchAgentsAntigravity,
                     DefaultsKey.notchAgentsCardOrder, DefaultsKey.notchAgentsHiddenCards, DefaultsKey.notchAgentsPeriod,
                     DefaultsKey.notchAgentsLimitDisplay, DefaultsKey.notchAgentsLimitFocus, DefaultsKey.notchAgentsLiveActivity, DefaultsKey.notchAgentsReadout,
                     DefaultsKey.notchAgentsFinishAlert, DefaultsKey.notchAgentsFinishMinimum, DefaultsKey.notchAgentsLimitAlert,

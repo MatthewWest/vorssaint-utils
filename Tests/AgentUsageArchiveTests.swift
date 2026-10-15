@@ -234,6 +234,7 @@ enum AgentUsageArchiveTests {
                      "a log written again in place while the app runs is read again at once, and the next launch counts only what it holds")
 
         openCode(suite, now: now)
+        antigravity(suite, now: now)
 
         // Developer builds keep the version of their release, and each one
         // may parse differently.
@@ -299,7 +300,7 @@ enum AgentUsageArchiveTests {
             ("AgentLiveSession", labels(sampleTurn),
              ["id", "provider", "started", "lastActivity", "model", "project", "tokens", "cost"]),
             ("AgentLogCursor", labels(cursor),
-             ["path", "provider", "tracksTurns", "parent", "openCode", "offset", "identity", "pending", "discarding",
+             ["path", "provider", "tracksTurns", "parent", "openCode", "antigravity", "offset", "identity", "pending", "discarding",
               "state", "modified", "restarted", "fingerprinted"]),
             ("AgentLogCursor.Saved", labels(cursor.saved),
              ["path", "provider", "offset", "identity", "discarding", "modified", "state", "fingerprint"]),
@@ -382,6 +383,89 @@ enum AgentUsageArchiveTests {
                         && replies.allSatisfy(\.reportedCost),
                      "the database read again counts each reply once, at the cost OpenCode recorded, as a fresh read does")
         suite.expect(saving(store, again) == contents, "with only OpenCode read again, the next save holds what the last one did")
+    }
+
+    /// Antigravity's database is read again at each launch. Nothing from it is
+    /// saved, and a launch that resumes the other logs counts it once, as a
+    /// fresh read would.
+    private static func antigravity(_ suite: TestSuite, now: Date) {
+        let sessionID = "conv_test_archive"
+        guard let (folder, dbURL, _) = NotchAgentTests.antigravityDatabase(sessionID: sessionID) else {
+            suite.expect(false, "the archive's Antigravity database opens")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let database = dbURL.path
+
+        let trajBytes = NotchAgentTests.pbTrajectoryMetadata(workspaceFolder: "/Users/me/code/web", rootID: sessionID)
+        NotchAgentTests.setTrajectoryMetadata(database, data: trajBytes)
+
+        let step1Meta = NotchAgentTests.pbStepMetadata(createdAt: 1790088000)
+        NotchAgentTests.insertStep(database, idx: 1, stepType: 14, status: 3, metadata: step1Meta)
+
+        let usageStats = NotchAgentTests.pbModelUsageStats(modelEnum: 1319, input: 100, output: 25, cacheRead: 40, thinking: 5, responseOutput: 20)
+        let step2Meta = NotchAgentTests.pbStepMetadata(createdAt: 1790088001, usage: usageStats, generatorModelEnum: 1319)
+        NotchAgentTests.insertStep(database, idx: 2, stepType: 15, status: 2, metadata: step2Meta)
+
+        let log = folder.appending(path: "rollout.jsonl")
+        try? Data(((firstHalf + secondHalf).joined(separator: "\n") + "\n").utf8).write(to: log)
+
+        func launch(_ store: AgentUsageStore, resuming saved: [String: AgentLogCursor] = [:]) -> [AgentLogCursor] {
+            [(log.path, AgentProvider.codex), (database, .antigravity)].map { path, provider in
+                let cursor = saved[path] ?? AgentLogCursor(path: path, provider: provider)
+                if provider == .antigravity {
+                    AgentAntigravityReader.read(path: path, cursor: cursor, now: now, since: .distantPast) { entries in
+                        store.apply(entries, file: path, provider: provider,
+                                    tracksTurns: cursor.tracksTurns, parent: cursor.parent,
+                                    modified: cursor.modified, now: now)
+                    }
+                } else {
+                    AgentLogReader.readAppended(cursor) { line in
+                        let entries = AgentLogParser.parseCodex(line, state: &cursor.state, now: now)
+                        store.apply(entries, file: path, provider: provider, tracksTurns: cursor.tracksTurns,
+                                    parent: cursor.parent, modified: cursor.modified, now: now)
+                    }
+                }
+                return cursor
+            }
+        }
+
+        func saving(_ store: AgentUsageStore, _ cursors: [AgentLogCursor]) -> AgentUsageArchive.Contents {
+            var saved = store.saved
+            saved.turns.removeAll { $0.provider == .antigravity }
+            saved.waiting.removeAll { $0.provider == .antigravity }
+            saved.records.removeAll { $0.record.provider == .antigravity }
+            return AgentUsageArchive.Contents(providers: [.codex, .antigravity], store: saved,
+                                              cursors: cursors.filter { $0.provider != .antigravity }.map(\.saved))
+        }
+
+        let first = AgentUsageStore()
+        let contents = saving(first, launch(first))
+        suite.expect(first.records.filter { $0.provider == .antigravity }.count == 1
+                        && first.turns[database] != nil
+                        && !contents.store.records.contains { $0.record.provider == .antigravity }
+                        && !(contents.store.turns + contents.store.waiting).contains { $0.provider == .antigravity }
+                        && !contents.cursors.contains { $0.provider == .antigravity },
+                     "nothing Antigravity gave is saved, not even the turn of a reply still being written")
+
+        // The step completes while the app is closed.
+        let step2FinishedMeta = NotchAgentTests.pbStepMetadata(createdAt: 1790088001, finishedAt: 1790088009, usage: usageStats, generatorModelEnum: 1319)
+        NotchAgentTests.antigravityExec(database, "DELETE FROM steps WHERE idx = 2;")
+        NotchAgentTests.insertStep(database, idx: 2, stepType: 15, status: 3, metadata: step2FinishedMeta)
+
+        let decoded = AgentUsageArchive.decode(AgentUsageArchive.encode(contents, build: build), build: build)
+        let resumed = decoded.map { AgentUsageArchive.resume($0, logs: [log.path, database], since: .distantPast) }
+        suite.expect(resumed?.unchanged == true && resumed?.cursors.keys.sorted() == [log.path],
+                     "a launch with Antigravity on resumes the other logs and keeps what was saved as it was")
+        let store = resumed?.store ?? AgentUsageStore()
+        let again = launch(store, resuming: resumed?.cursors ?? [:])
+        let fresh = AgentUsageStore()
+        _ = launch(fresh)
+        let replies = store.records.filter { $0.provider == .antigravity }
+        suite.expect(store.records == fresh.records && store.turns == fresh.turns && replies.count == 1
+                        && replies.allSatisfy { $0.model == "gemini-3.8-flash" },
+                     "the database read again counts each reply once, as a fresh read does")
+        suite.expect(saving(store, again) == contents, "with only Antigravity read again, the next save holds what the last one did")
     }
 }
 
